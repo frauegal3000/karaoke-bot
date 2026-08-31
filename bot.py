@@ -1,28 +1,39 @@
 """
-Karaoke Queue Telegram Bot — single-file, in-memory version (no database).
+Karaoke Queue Telegram Bot — button-driven, in-memory version (no database).
 
-State (queue, admin logins) lives entirely in memory for the
-process lifetime. Restarting the bot clears everything — that's expected
-for a single karaoke night, but worth knowing if the process gets restarted
-mid-session.
+Everything is driven by keyboard buttons instead of typed commands. Two
+guided conversations exist:
+  - "Add song": asks for name, then a Spotify/YouTube link, step by step.
+  - "I'm an admin": asks for the password, then unlocks the admin menu.
+
+State (queue, history, admin logins) lives in memory only — restarting the
+process clears everything. Fine for a single karaoke night, not for
+long-term persistence.
 
 Environment variables required:
     TELEGRAM_BOT_TOKEN  — from BotFather
-    ADMIN_PASSWORD      — password for /admin
+    ADMIN_PASSWORD      — password for admin login
 
 Run:
     pip install -r requirements.txt
     python bot.py
 """
 
-import functools
 import logging
 import os
 import re
 
 from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
+from telegram import ReplyKeyboardMarkup, InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -42,21 +53,7 @@ ADMIN_PASSWORD = _require_env("ADMIN_PASSWORD")
 
 MAX_SONGS_WHEN_QUEUE_SMALL = 2
 MAX_SONGS_WHEN_QUEUE_LARGE = 1
-QUEUE_SIZE_THRESHOLD = 5
-
-WELCOME_MESSAGE = (
-    "🎤 Welcome to the Karaoke Queue Bot!\n\n"
-    "Send a Spotify link to your song if it has lyrics attached — we're using "
-    "AI to remove vocals from original songs, so audio quality is way better "
-    "than typical karaoke tracks. YouTube links also work if that's easier.\n\n"
-    "Commands:\n"
-    "/add <song> - <artist> - <link> — join the queue\n"
-    "/status — check your place in line\n"
-    "/skip — remove yourself from the queue\n"
-    "/performed — mark your performance complete\n\n"
-    "Example:\n"
-    "/add Bohemian Rhapsody - Queen - https://open.spotify.com/track/xxxx"
-)
+QUEUE_SIZE_THRESHOLD = 10
 
 SPOTIFY_URL_RE = re.compile(
     r"^https?://(open\.)?spotify\.com/(intl-\w+/)?track/[\w]+", re.IGNORECASE
@@ -65,14 +62,13 @@ YOUTUBE_URL_RE = re.compile(
     r"^https?://(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[\w-]+", re.IGNORECASE
 )
 
-ADD_USAGE = "Usage: /add Song Title - Artist - Spotify or YouTube Link"
-NOT_AUTHENTICATED_MSG = "You need to authenticate first. Use /admin <password>"
-
-# Callback data prefixes
-CB_VIEW_QUEUE = "view_queue"
-CB_DONE_SELECT = "done_select:"
-CB_CONFIRM_ADVANCE = "confirm_advance:"
-CB_CANCEL = "cancel"
+WELCOME_MESSAGE = (
+    "🎤 Welcome to the Karaoke Queue Bot!\n\n"
+    "Send a Spotify link to your song if it has lyrics attached — we're using "
+    "AI to remove vocals from original songs, so audio quality is way better "
+    "than typical karaoke tracks. YouTube links also work if that's easier.\n\n"
+    "Use the buttons below to get started."
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -80,14 +76,36 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 
 # Each submission: {telegram_user_id, display_name, song_title, artist, link, source}
+# Note: since users add songs via buttons rather than a structured command,
+# song_title/artist aren't separately collected — the link speaks for itself,
+# and "song_title" doubles as a short label built from the display name.
 queue: list[dict] = []
+performed_songs: list[dict] = []
 admin_user_ids: set[int] = set()
+
+# Conversation states
+ASK_NAME, ASK_LINK = range(2)
+ASK_PASSWORD = range(2, 3)[0]
+
+# Button labels (also used for exact-text matching)
+BTN_ADD_SONG = "🎤 Add song"
+BTN_STATUS = "📊 My status"
+BTN_SKIP = "⏭ Skip my turn"
+BTN_DONE = "✅ Mark as done"
+BTN_HISTORY = "📜 History"
+BTN_SHOW_QUEUE = "👀 Show current queue"
+BTN_ADMIN_LOGIN = "🔑 I'm an admin"
+BTN_CANCEL = "❌ Cancel"
+
+BTN_ADMIN_QUEUE = "📋 Full queue (admin)"
+BTN_ADMIN_ADVANCE = "⏭ Advance queue (admin)"
+BTN_ADMIN_REMOVE = "🗑 Remove participant (admin)"
+BTN_ADMIN_RESTART = "🔄 Restart session (admin)"
 
 
 def _current_limit() -> int:
@@ -104,56 +122,97 @@ def _classify_link(link: str) -> str | None:
     return None
 
 
-def _get_display_name(user) -> str:
-    """Get display name from Telegram user: prefer username, fallback to first_name."""
-    if user.username:
-        return f"@{user.username}"
-    return user.first_name or "Anonymous"
+def _main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    rows = [
+        [BTN_ADD_SONG, BTN_STATUS],
+        [BTN_SKIP, BTN_DONE],
+        [BTN_SHOW_QUEUE, BTN_HISTORY],
+        [BTN_ADMIN_LOGIN],
+    ]
+    if user_id in admin_user_ids:
+        rows.append([BTN_ADMIN_QUEUE, BTN_ADMIN_ADVANCE])
+        rows.append([BTN_ADMIN_REMOVE, BTN_ADMIN_RESTART])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+def _cancel_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[BTN_CANCEL]], resize_keyboard=True)
 
 
 # ---------------------------------------------------------------------------
-# User commands
+# Basic commands / menu
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    keyboard = [[InlineKeyboardButton("Show Full Queue", callback_data=CB_VIEW_QUEUE)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(WELCOME_MESSAGE, reply_markup=reply_markup)
+    await update.message.reply_text(
+        WELCOME_MESSAGE, reply_markup=_main_keyboard(update.effective_user.id)
+    )
 
 
-async def add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = " ".join(context.args)
-    parts = [p.strip() for p in text.split(" - ")]
+# ---------------------------------------------------------------------------
+# "Add song" conversation
+# ---------------------------------------------------------------------------
 
-    if len(parts) != 3 or not all(parts):
-        await update.message.reply_text(ADD_USAGE)
-        return
-
-    song_title, artist, link = parts
-    source = _classify_link(link)
-
-    if source is None:
-        await update.message.reply_text(
-            "Please provide a valid Spotify or YouTube link."
-        )
-        return
-
+async def add_song_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     telegram_user_id = update.effective_user.id
-    display_name = _get_display_name(update.effective_user)
     existing_count = sum(1 for s in queue if s["telegram_user_id"] == telegram_user_id)
 
     if existing_count >= _current_limit():
         await update.message.reply_text(
-            "Queue is busy — you already have a song queued. Wait for your turn!"
+            "Queue is busy — you already have a song queued. Wait for your turn!",
+            reply_markup=_main_keyboard(telegram_user_id),
         )
-        return
+        return ConversationHandler.END
 
+    await update.message.reply_text(
+        "What name should show up in the queue?", reply_markup=_cancel_keyboard()
+    )
+    return ASK_NAME
+
+
+async def add_song_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if not name:
+        await update.message.reply_text("Please send a name (or tap Cancel).")
+        return ASK_NAME
+
+    context.user_data["pending_name"] = name
+    await update.message.reply_text(
+        "Now send a Spotify or YouTube link to the song.",
+        reply_markup=_cancel_keyboard(),
+    )
+    return ASK_LINK
+
+
+async def add_song_got_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    link = update.message.text.strip()
+    source = _classify_link(link)
+
+    if source is None:
+        await update.message.reply_text(
+            "That doesn't look like a valid Spotify or YouTube link — try again, "
+            "or tap Cancel."
+        )
+        return ASK_LINK
+
+    telegram_user_id = update.effective_user.id
+    existing_count = sum(1 for s in queue if s["telegram_user_id"] == telegram_user_id)
+
+    if existing_count >= _current_limit():
+        await update.message.reply_text(
+            "Queue is busy — you already have a song queued. Wait for your turn!",
+            reply_markup=_main_keyboard(telegram_user_id),
+        )
+        context.user_data.pop("pending_name", None)
+        return ConversationHandler.END
+
+    display_name = context.user_data.pop("pending_name", "Someone")
     queue.append(
         {
             "telegram_user_id": telegram_user_id,
             "display_name": display_name,
-            "song_title": song_title,
-            "artist": artist,
+            "song_title": link,  # link doubles as the identifying detail
+            "artist": "",
             "link": link,
             "source": source,
         }
@@ -163,109 +222,118 @@ async def add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ahead = rank - 1
     people_word = "person" if ahead == 1 else "people"
     await update.message.reply_text(
-        f"Added! You're #{rank} in the queue. {ahead} {people_word} ahead of you."
+        f"Added! You're #{rank} in the queue. {ahead} {people_word} ahead of you.",
+        reply_markup=_main_keyboard(telegram_user_id),
     )
+    return ConversationHandler.END
 
+
+async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.pop("pending_name", None)
+    await update.message.reply_text(
+        "Cancelled.", reply_markup=_main_keyboard(update.effective_user.id)
+    )
+    return ConversationHandler.END
+
+
+add_song_conversation = ConversationHandler(
+    entry_points=[MessageHandler(filters.Regex(f"^{re.escape(BTN_ADD_SONG)}$"), add_song_entry)],
+    states={
+        ASK_NAME: [
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"), cancel_conversation),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, add_song_got_name),
+        ],
+        ASK_LINK: [
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"), cancel_conversation),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, add_song_got_link),
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    allow_reentry=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Simple one-tap user actions
+# ---------------------------------------------------------------------------
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_user_id = update.effective_user.id
-    user_entries = [(i, s) for i, s in enumerate(queue) if s["telegram_user_id"] == telegram_user_id]
+    idx = next(
+        (i for i, s in enumerate(queue) if s["telegram_user_id"] == telegram_user_id),
+        None,
+    )
 
-    if not user_entries:
-        await update.message.reply_text(
-            "You don't have any songs in the queue. Use /add to join!"
-        )
+    if idx is None:
+        await update.message.reply_text("You don't have any songs in the queue yet.")
         return
 
-    idx, entry = user_entries[0]
-    ahead = idx
-    if ahead == 0:
+    if idx == 0:
         await update.message.reply_text("You're up next! 🎤")
         return
 
     person_before = queue[idx - 1]
-    people_word = "person" if ahead == 1 else "people"
+    people_word = "person" if idx == 1 else "people"
     await update.message.reply_text(
-        f"You're #{idx + 1} in the queue. {ahead} {people_word} ahead of you. "
-        f"The person before you: {person_before['display_name']} "
-        f"singing '{person_before['song_title']}'."
+        f"You're #{idx + 1} in the queue. {idx} {people_word} ahead of you. "
+        f"The person before you: {person_before['display_name']}."
     )
 
 
 async def skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_user_id = update.effective_user.id
-    user_entries = [(i, s) for i, s in enumerate(queue) if s["telegram_user_id"] == telegram_user_id]
+    idx = next(
+        (i for i, s in enumerate(queue) if s["telegram_user_id"] == telegram_user_id),
+        None,
+    )
 
-    if not user_entries:
+    if idx is None:
         await update.message.reply_text("You don't have any songs in the queue.")
         return
 
-    if len(user_entries) == 1:
-        idx, removed = user_entries[0]
-        queue.pop(idx)
-        await update.message.reply_text(f"Removed '{removed['song_title']}' from the queue.")
-        await _notify_new_front_of_queue(context)
-    else:
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{s['song_title']} - {s['artist']}",
-                callback_data=f"skip_select:{i}"
-            )]
-            for i, s in user_entries
-        ]
-        keyboard.append([InlineKeyboardButton("Cancel", callback_data=CB_CANCEL)])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "Which song do you want to remove?",
-            reply_markup=reply_markup
-        )
+    removed = queue.pop(idx)
+    await update.message.reply_text(f"Removed '{removed['display_name']}' from the queue.")
+    await _notify_new_front_of_queue(context)
 
 
-async def performed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     telegram_user_id = update.effective_user.id
-    user_entries = [(i, s) for i, s in enumerate(queue) if s["telegram_user_id"] == telegram_user_id]
 
-    if not user_entries:
-        await update.message.reply_text("You don't have any songs in the queue.")
+    if not queue or queue[0]["telegram_user_id"] != telegram_user_id:
+        await update.message.reply_text(
+            "You don't have a song in the queue, or it isn't your turn yet."
+        )
         return
 
-    if len(user_entries) == 1:
-        idx, song = user_entries[0]
-        if idx != 0:
-            await update.message.reply_text("It isn't your turn yet.")
-            return
-        queue.pop(idx)
-        await update.message.reply_text(f"Nice job on '{song['song_title']}'! 🎤")
-        await _notify_new_front_of_queue(context)
-    else:
-        keyboard = [
-            [InlineKeyboardButton(
-                f"{s['song_title']} - {s['artist']}",
-                callback_data=f"{CB_DONE_SELECT}{i}"
-            )]
-            for i, s in user_entries
-        ]
-        keyboard.append([InlineKeyboardButton("Cancel", callback_data=CB_CANCEL)])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            "Which song did you perform?",
-            reply_markup=reply_markup
-        )
+    completed = queue.pop(0)
+    performed_songs.append(
+        {"display_name": completed["display_name"], "link": completed["link"]}
+    )
+    await update.message.reply_text(
+        f"Nice job, {completed['display_name']}! Added to tonight's history."
+    )
+    await _notify_new_front_of_queue(context)
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not performed_songs:
+        await update.message.reply_text("No songs performed yet tonight.")
+        return
+
+    lines = [
+        f"{i}. {row['display_name']}" for i, row in enumerate(performed_songs, start=1)
+    ]
+    await update.message.reply_text("Tonight's performances:\n" + "\n".join(lines))
 
 
 async def _notify_new_front_of_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not queue:
         return
-
     next_up = queue[0]
     try:
         await context.bot.send_message(
             chat_id=next_up["telegram_user_id"],
-            text=(
-                f"It's your turn! Head to the stage. "
-                f"Song: {next_up['song_title']} by {next_up['artist']}. "
-                f"Link: {next_up['link']}"
-            ),
+            text=f"It's your turn! Head to the stage. Link: {next_up['link']}",
         )
     except Exception:
         logger.exception(
@@ -275,271 +343,156 @@ async def _notify_new_front_of_queue(context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 # ---------------------------------------------------------------------------
-# Callback handlers
+# Admin login conversation
 # ---------------------------------------------------------------------------
 
-async def user_queue_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Display queue to users."""
-    query = update.callback_query
-    await query.answer()
-
-    if not queue:
-        text = "The queue is empty."
-    else:
-        lines = [
-            f"{i}. {s['display_name']} - {s['song_title']} ({s['artist']})"
-            for i, s in enumerate(queue, start=1)
-        ]
-        text = "Current queue:\n" + "\n".join(lines)
-
-    keyboard = [[InlineKeyboardButton("Refresh", callback_data=CB_VIEW_QUEUE)]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    await query.edit_message_text(text, reply_markup=reply_markup)
-
-
-async def handle_done_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle user selecting which song they performed."""
-    query = update.callback_query
-    await query.answer()
-
-    idx = int(query.data.replace(CB_DONE_SELECT, ""))
-    telegram_user_id = update.effective_user.id
-
-    if idx >= len(queue):
-        await query.edit_message_text("That song is no longer in the queue.")
-        return
-
-    song = queue[idx]
-
-    if song["telegram_user_id"] != telegram_user_id:
-        await query.edit_message_text("That's not your song!")
-        return
-
-    if idx != 0:
-        await query.edit_message_text("It's not your turn yet for that song.")
-        return
-
-    queue.pop(idx)
-    await query.edit_message_text(f"Nice job on '{song['song_title']}'! 🎤")
-    await _notify_new_front_of_queue(context)
-
-
-async def handle_skip_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle user selecting which song to skip/remove."""
-    query = update.callback_query
-    await query.answer()
-
-    idx = int(query.data.replace("skip_select:", ""))
-    telegram_user_id = update.effective_user.id
-
-    if idx >= len(queue):
-        await query.edit_message_text("That song is no longer in the queue.")
-        return
-
-    song = queue[idx]
-
-    if song["telegram_user_id"] != telegram_user_id:
-        await query.edit_message_text("That's not your song!")
-        return
-
-    queue.pop(idx)
-    await query.edit_message_text(f"Removed '{song['song_title']}' from the queue.")
-    await _notify_new_front_of_queue(context)
-
-
-async def handle_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle cancel button press."""
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("Cancelled.")
-
-
-async def handle_advance_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle admin confirmation to advance queue."""
-    query = update.callback_query
-    await query.answer()
-
-    if update.effective_user.id not in admin_user_ids:
-        await query.edit_message_text("You are not authorized to do this.")
-        return
-
-    if not queue:
-        await query.edit_message_text("The queue is already empty.")
-        return
-
-    skipped = queue.pop(0)
-    await query.edit_message_text(
-        f"Skipped {skipped['display_name']} ('{skipped['song_title']}')."
-    )
-
-    # Notify the skipped user
-    try:
-        await context.bot.send_message(
-            chat_id=skipped["telegram_user_id"],
-            text=f"Your song '{skipped['song_title']}' has been skipped by an admin."
+async def admin_login_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.effective_user.id in admin_user_ids:
+        await update.message.reply_text(
+            "You're already authenticated as admin.",
+            reply_markup=_main_keyboard(update.effective_user.id),
         )
-    except Exception:
-        logger.warning("Failed to notify user %s about being skipped", skipped["telegram_user_id"])
+        return ConversationHandler.END
 
-    await _notify_new_front_of_queue(context)
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Route callback queries to appropriate handlers."""
-    query = update.callback_query
-    data = query.data
-
-    if data == CB_VIEW_QUEUE:
-        await user_queue_view(update, context)
-    elif data.startswith(CB_DONE_SELECT):
-        await handle_done_selection(update, context)
-    elif data.startswith("skip_select:"):
-        await handle_skip_selection(update, context)
-    elif data.startswith(CB_CONFIRM_ADVANCE):
-        await handle_advance_confirmation(update, context)
-    elif data == CB_CANCEL:
-        await handle_cancel(update, context)
-    else:
-        await query.answer("Unknown action")
-
-
-# ---------------------------------------------------------------------------
-# Admin commands
-# ---------------------------------------------------------------------------
-
-def require_admin(handler):
-    @functools.wraps(handler)
-    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if update.effective_user.id not in admin_user_ids:
-            await update.message.reply_text(NOT_AUTHENTICATED_MSG)
-            return
-        return await handler(update, context)
-
-    return wrapped
-
-
-async def admin_login(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /admin <password>")
-        return
-
-    password = " ".join(context.args)
-    if password != ADMIN_PASSWORD:
-        await update.message.reply_text("Incorrect password.")
-        return
-
-    admin_user_ids.add(update.effective_user.id)
-    await update.message.reply_text("You're now authenticated as admin.")
-
-
-@require_admin
-async def remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.message.reply_text("Usage: /remove <position or name>")
-        return
-
-    identifier = " ".join(context.args).strip()
-    target_idx = None
-
-    if identifier.isdigit():
-        pos = int(identifier)
-        if 1 <= pos <= len(queue):
-            target_idx = pos - 1
-    else:
-        needle = identifier.lower()
-        target_idx = next(
-            (i for i, s in enumerate(queue) if needle in s["display_name"].lower()),
-            None,
-        )
-
-    if target_idx is None:
-        await update.message.reply_text(f"No matching submission found for '{identifier}'.")
-        return
-
-    removed = queue.pop(target_idx)
     await update.message.reply_text(
-        f"Removed '{removed['song_title']}' by {removed['display_name']} from the queue."
+        "Send the admin password:", reply_markup=_cancel_keyboard()
     )
+    return ASK_PASSWORD
 
-    # Notify the removed user via DM
-    try:
-        await context.bot.send_message(
-            chat_id=removed["telegram_user_id"],
-            text=f"Your song '{removed['song_title']}' has been removed from the queue by an admin."
+
+async def admin_login_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    password = update.message.text.strip()
+    telegram_user_id = update.effective_user.id
+
+    if password != ADMIN_PASSWORD:
+        await update.message.reply_text(
+            "Incorrect password.", reply_markup=_main_keyboard(telegram_user_id)
         )
-    except Exception:
-        logger.warning("Failed to notify user %s about removal", removed["telegram_user_id"])
+        return ConversationHandler.END
 
-    await _notify_new_front_of_queue(context)
+    admin_user_ids.add(telegram_user_id)
+    await update.message.reply_text(
+        "You're now authenticated as admin. Admin buttons unlocked below.",
+        reply_markup=_main_keyboard(telegram_user_id),
+    )
+    return ConversationHandler.END
 
 
-@require_admin
-async def queue_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+admin_login_conversation = ConversationHandler(
+    entry_points=[
+        MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN_LOGIN)}$"), admin_login_entry)
+    ],
+    states={
+        ASK_PASSWORD: [
+            MessageHandler(filters.Regex(f"^{re.escape(BTN_CANCEL)}$"), cancel_conversation),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, admin_login_got_password),
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel_conversation)],
+    allow_reentry=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# Admin one-tap actions + inline keyboards
+# ---------------------------------------------------------------------------
+
+async def _require_admin(update: Update) -> bool:
+    if update.effective_user.id not in admin_user_ids:
+        await update.message.reply_text(
+            "You need to authenticate first — tap 🔑 I'm an admin."
+        )
+        return False
+    return True
+
+
+async def admin_queue_view(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update):
+        return
     if not queue:
         await update.message.reply_text("The queue is empty.")
         return
 
     lines = [
-        f"{i}. {s['display_name']}, {s['link']}"
+        f"{i}. {s['display_name']} [{s['source']}] [user_id={s['telegram_user_id']}] {s['link']}"
         for i, s in enumerate(queue, start=1)
     ]
     await update.message.reply_text("Full queue:\n" + "\n".join(lines))
 
 
-@require_admin
-async def ping_next(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Ping the next participant in the queue."""
+async def admin_advance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update):
+        return
+    if not queue:
+        await update.message.reply_text("The queue is empty — nothing to advance.")
+        return
+
+    completed = queue.pop(0)
+    performed_songs.append(
+        {"display_name": completed["display_name"], "link": completed["link"]}
+    )
+    await update.message.reply_text(f"Advanced. '{completed['display_name']}' marked complete.")
+    await _notify_new_front_of_queue(context)
+
+
+async def admin_remove_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update):
+        return
     if not queue:
         await update.message.reply_text("The queue is empty.")
         return
 
-    next_up = queue[0]
-    try:
-        await context.bot.send_message(
-            chat_id=next_up["telegram_user_id"],
-            text=(
-                f"Hey {next_up['display_name']}! You're up next! "
-                f"Please head to the stage. "
-                f"Song: {next_up['song_title']} by {next_up['artist']}. "
-                f"Link: {next_up['link']}"
-            ),
-        )
-        await update.message.reply_text(f"Pinged {next_up['display_name']}.")
-    except Exception:
-        logger.exception("Failed to ping user %s", next_up["telegram_user_id"])
-        await update.message.reply_text(f"Failed to ping {next_up['display_name']}.")
+    keyboard = [
+        [InlineKeyboardButton(f"❌ {s['display_name']}", callback_data=f"remove:{i}")]
+        for i, s in enumerate(queue)
+    ]
+    await update.message.reply_text(
+        "Tap a participant to remove them:", reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
-@require_admin
-async def advance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show confirmation before advancing the queue (skipping current performer)."""
-    if not queue:
-        await update.message.reply_text("The queue is empty.")
+async def admin_restart_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await _require_admin(update):
         return
-
-    current = queue[0]
     keyboard = [
         [
-            InlineKeyboardButton("Yes, advance", callback_data=f"{CB_CONFIRM_ADVANCE}yes"),
-            InlineKeyboardButton("Cancel", callback_data=CB_CANCEL),
+            InlineKeyboardButton("✅ Yes, restart", callback_data="restart:confirm"),
+            InlineKeyboardButton("Cancel", callback_data="restart:cancel"),
         ]
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
     await update.message.reply_text(
-        f"Are you sure you want to skip {current['display_name']} "
-        f"('{current['song_title']}') and advance the queue?",
-        reply_markup=reply_markup
+        "This clears the entire queue and history. Are you sure?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
 
-@require_admin
-async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    queue.clear()
-    await update.message.reply_text(
-        "Session ended. Queue cleared. Ready for next karaoke night!"
-    )
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id not in admin_user_ids:
+        await query.edit_message_text("You need to authenticate as admin first.")
+        return
+
+    data = query.data
+
+    if data.startswith("remove:"):
+        idx = int(data.split(":", 1)[1])
+        if 0 <= idx < len(queue):
+            removed = queue.pop(idx)
+            await query.edit_message_text(f"Removed '{removed['display_name']}' from the queue.")
+        else:
+            await query.edit_message_text("That participant is no longer in the queue.")
+
+    elif data == "restart:confirm":
+        queue.clear()
+        performed_songs.clear()
+        await query.edit_message_text(
+            "Session restarted. Queue and history cleared. Ready for next karaoke night!"
+        )
+
+    elif data == "restart:cancel":
+        await query.edit_message_text("Restart cancelled.")
 
 
 # ---------------------------------------------------------------------------
@@ -549,25 +502,32 @@ async def end(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # User commands
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("add", add))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("skip", skip))
-    application.add_handler(CommandHandler("performed", performed))
 
-    # Admin commands
-    application.add_handler(CommandHandler("admin", admin_login))
-    application.add_handler(CommandHandler("remove", remove))
-    application.add_handler(CommandHandler("queue", queue_view))
-    application.add_handler(CommandHandler("end", end))
-    application.add_handler(CommandHandler("ping", ping_next))
-    application.add_handler(CommandHandler("advance", advance))
+    application.add_handler(add_song_conversation)
+    application.add_handler(admin_login_conversation)
 
-    # Callback query handler for inline keyboards
-    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_STATUS)}$"), status))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_SKIP)}$"), skip))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_DONE)}$"), done))
+    application.add_handler(MessageHandler(filters.Regex(f"^{re.escape(BTN_HISTORY)}$"), history))
 
-    logger.info("Starting Karaoke Queue Bot (in-memory, polling)...")
+    application.add_handler(
+        MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN_QUEUE)}$"), admin_queue_view)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN_ADVANCE)}$"), admin_advance)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN_REMOVE)}$"), admin_remove_menu)
+    )
+    application.add_handler(
+        MessageHandler(filters.Regex(f"^{re.escape(BTN_ADMIN_RESTART)}$"), admin_restart_menu)
+    )
+
+    application.add_handler(CallbackQueryHandler(admin_callback_handler))
+
+    logger.info("Starting Karaoke Queue Bot (button-driven, in-memory, polling)...")
     application.run_polling(allowed_updates=["message", "callback_query"])
 
 
